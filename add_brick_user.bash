@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 # add_brick_user.bash — add (or update) a user in runtime/users.conf.
 # You may have your bricks.cnf pointing to different file though.. So 
 # be careful. You can also just use brickspw directly to generate a pasword
