@@ -1,17 +1,33 @@
 # BRICKS config file
 # copyright 2026 by moshix
 
-dns_name=YourDNS                                                                                                                                                             
+dns_name=localhost
 port=2300                                                                                                                                                                            
 tlsport=2023                                                                                                                                                                         
 tlscert=
-tlskey=www.moshix.tech.key                                                                                                                                                           
+tlskey=
 #start_TLS=yes         
 enforce_secure_login=no
-#secure_login_transacton=cssn
+GMTEXT='DFHZC2312 Welcome to BRICKS"
+#show welcoe to bricks?
+show_welcome=yes
+
+#secure_login_transaction=CSSN
+start_transaction=HELP
 start_web3270=yes
 web3270_port=9000
 max_conns_per_ip=16
+
+# how many most frequently used maps should be kept in memory 
+map_cache = 128
+
+
+#EXEC CICS WEB related settings
+enable_wapi=yes
+wapi_port=8080
+wapi_tls_port=8443
+
+
 # ── Sandbox for sequential file I/O
 # Directory used by REXX (LINEIN / LINEOUT / STREAM) and COBOL
 # (EXEC CICS READQ TD / WRITEQ TD / DELETEQ TD) for sequential text

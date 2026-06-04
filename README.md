@@ -11,7 +11,7 @@
 
 > Bricks follow the same approach*
 
-Chat with BRICKS users and administrators [here](https://discord.gg/6NWE4Gp7kR)
+Chat with BRICKS developers and master operators [here](https://discord.gg/6NWE4Gp7kR)
 
 A Go implementation of an IBM CICS-compatible 3270 transaction server. Users
 dial in with a 3270 terminal emulator, sign on via a built-in CSSN screen, and
@@ -69,6 +69,38 @@ the TRANSID prompt; type `CSSN` to sign on, then any defined TRANSID
 
 ---
 
+## Breaking out of a transaction — `PA1`
+
+A transaction program drives the terminal with `EXEC CICS SEND MAP` /
+`SEND TEXT` and waits for the operator to press a key. A well-behaved
+program offers an exit — conventionally `PF3` — but a program that never
+checks `EIBAID` for an exit key (or simply has a logic bug) can leave the
+terminal stuck on its screen with no way back to the TRANSID prompt.
+
+**Press `PA1` to break out.** bricks intercepts `PA1` at every screen
+wait, *before* the program sees it: the running transaction is aborted
+and the terminal is returned to the empty TRANSID prompt. `PA1` cannot be
+consumed by the program — even one that arms `HANDLE AID PA1(...)` never
+receives it — so it is a guaranteed escape from a stuck transaction.
+
+Break-out is treated like an abend, not a clean `RETURN`: any recoverable
+work the task did since its last `SYNCPOINT` (FILE / TS / TD writes,
+uncommitted SQL) is rolled back, because the task did not finish, and no
+chained `RETURN TRANSID` task starts. The console logs one line naming
+the terminal:
+
+```
+term=T123: PA1 break-out, transaction aborted
+```
+
+> **SysReq.** The 3270 *System Request* key is not decoded by the
+> datastream layer bricks is built on, so it cannot trigger break-out —
+> `PA1` is the single supported break-out key. Most emulators expose
+> `PA1` directly (in c3270 / x3270 it is the `PA(1)` action); consult
+> your emulator's key map.
+
+---
+
 ## Configuration — `bricks.cnf`
 
 Key=value, one per line, `#` for comments. Keys are case-insensitive.
@@ -81,28 +113,45 @@ Key=value, one per line, `#` for comments. Keys are case-insensitive.
 | `enforce_secure_login`       | `no`                          | `yes` blocks every TRANSID except the logon TRANSID until the session is authenticated. |
 | `tlscert`                    | (none)                        | Path to PEM cert. |
 | `tlskey`                     | (none)                        | Path to PEM key. |
-| `secure_login_transacton`    | `CSSN`                        | The 4-character logon TRANSID. Built-in `CSSN` is implemented in Go; any other value must exist in `transactions.conf`. Misspelling preserved for back-compat; `secure_login_transaction` and `logon_transid` are also accepted. |
+| `secure_login_transacton`    | `CSSN`                        | The 4-character logon TRANSID. Built-in `CSSN` is implemented in Go; any other value must exist in `transactions.conf`. Misspelling preserved for back-compat; `secure_login_transaction` and `logon_transid` are also accepted. `CESN` (the IBM-traditional spelling) is accepted as a drop-in alias for `CSSN` and `CESF` for `CSSF` — both are canonicalised before dispatch, so every other knob and screen sees only the canonical name. |
+| `start_transaction`          | (none)                        | If set, the 4-character TRANSID dispatched automatically after a successful `CSSN` sign-on — useful when a deployment has a clear "this is the app's home screen" and operators shouldn't have to type the first transid by hand. Empty / unset (the default) keeps today's behaviour: the operator lands at the blank TRANSID prompt with the `CSSNOK` success map. Rejected at startup if the value is neither empty nor exactly 4 characters, or if it equals `logon_transid` (loop guard). If the named transaction is missing from `transactions.conf` at run time, bricks logs one warning line and drops the operator at the blank prompt — no operator-facing error screen. ACLs on the target still apply: an unauthorised user lands on the standard "access denied" message. |
 | `users_file`                 | `runtime/users.conf`          | Auth source. |
 | `transactions_file`          | `runtime/transactions.conf`   | TRANSID dispatch table. |
 | `maps_dir`                   | `runtime/map`                 | Directory of `*.map` files. |
-| `rexx_dir`                   | `runtime/rexx`                | Directory of REXX programs. |
-| `cobol_dir`                  | `runtime/cobol`               | Directory of COBOL programs. |
+| `rexx_dir`                   | `runtime/rexx`                | Directory of REXX programs. Sub-directories are supported: `transactions.conf` may reference programs as `subdir/file.rexx`. `CEDA PROGRAM` walks the tree recursively (depth cap 8, hidden-prefixed entries skipped). |
+| `cobol_dir`                  | `runtime/cobol`               | Directory of COBOL programs. Same sub-directory support as `rexx_dir`. |
 | `copybook_dir`               | `runtime/cobolcopy`           | Directory of COBOL copybooks (`SQLCA.cpy`, etc.). |
 | `runtime_dir`                | `runtime`                     | Root for `maps_dir` / `rexx_dir` / `cobol_dir` / `tmp_dir` / `copybook_dir` when those aren't set explicitly. Set this to relocate the whole runtime tree in one knob. |
 | `data_dir`                   | `data`                        | Holds `files.boltdb` (FILE store + TS queues). |
 | `tmp_dir`                    | `runtime/tmp`                 | Sandbox directory for sequential text I/O (REXX `LINEIN`/`LINEOUT`, COBOL `READQ TD`/`WRITEQ TD`). Strict: ASCII only, LF-terminated, flat namespace, no traversal. See [Sequential file I/O — `tmp_dir`](#sequential-file-io--tmp_dir). |
-| `ntp_server`                 | `time.google.com`             | NTP server polled every 5 minutes to correct bricks's in-memory wall clock. EIBTIME / EIBDATE / FORMATTIME consult this corrected clock. Set to `off` to disable. Failures are non-fatal — bricks logs and continues with the previous offset (or the raw host clock if no sync has ever succeeded). See [Time synchronisation](#time-synchronisation). |
+| `ntp_server`                 | `time.google.com`             | NTP server polled every 12 hours to correct bricks's in-memory wall clock. EIBTIME / EIBDATE / FORMATTIME consult this corrected clock. Set to `off` to disable. Failures are non-fatal — bricks logs and continues with the previous offset (or the raw host clock if no sync has ever succeeded). See [Time synchronisation](#time-synchronisation). |
 | `time_zone`                  | `Z` (UTC)                     | Military zone letter (`Z`=UTC, `A`–`M`=UTC+1..+12, `N`–`Y`=UTC-1..-12). Applies to operator-visible time fields; ABSTIME stays UTC milliseconds. See [Time synchronisation](#time-synchronisation). |
 | `log_location`               | `log`                         | Directory where bricks writes per-run log files. On startup a new file `YYYY-MM-DD_HH-MM-SS.log` is created; every console line is appended (with ANSI color stripped) and prefixed with a 4-character subsystem tag. Set to `off` to disable file logging. See [Logging](#logging). |
 | `idle_timeout_secs`          | `900`                         | Read deadline applied **only before sign-on** — to the LogonPrompt and to the BlankPrompt of an unauthenticated session, plus the CSSN sign-on input reads. A peer that completes telnet negotiation but never signs on is dropped after this many seconds so a half-open handshake doesn't tie up a `max_conns_per_ip` slot forever. **Once the operator has signed on, the deadline is not set** — a signed-on terminal sits at the blank prompt indefinitely and only disconnects on TCP close or an explicit `CSSF DISC` / `DISCONNECT` / `GOODNIGHT`. `CSSF LOGOFF` clears the authentication flag, so the deadline resumes for the now-unauthenticated session. |
 | `max_conns_per_ip`           | `8`                           | Per-client cap. |
 | `program_cache`              | `4`                           | L2 LRU pool size in MB for parsed REXX/COBOL programs (a 128-entry L1 of decoded ASTs sits in front of it). Allocated once at startup as eight contiguous byte slabs — one per shard — and reused for the life of the process; Go's GC never scans the program bytes. Valid range is `1..16384` (1 MB floor, 16 GB cap); out-of-range values are rejected at startup. Live counters for both tiers are visible in `CEMT MONITOR`. |
+| `map_cache`                  | `128`                         | LRU bound on the number of **parsed** 3270 maps held resident. The directory index — `(map name → file path, mtime, size, SHA-256)` — always covers every `*.map` in `maps_dir`, so any map remains resolvable by name; only the parsed body is bounded. A `SEND/RECEIVE MAP` for a cached map is zero-parse; an evicted map is re-parsed on next lookup (microseconds) and re-inserted. Evicted entries drop their `*Map` pointer and the Go GC reclaims them on the next cycle, capping both steady-state memory and per-GC pointer-graph walk regardless of how many maps a deployment ships. Valid range is `1..1028`; rejected at startup if out of range. Live counters and runtime resize are visible in `CEMT P M`. |
 | `banner`                     | `BRICKS Transaction Server`   | Shown at top of system screens. |
-| `dns_name`                   | (none)                        | Informational; printed at startup. |
+| `gmtext`                     | `Welcome to bricks`           | **IBM CICS SIT `GMTEXT` equivalent — operator-configured "Good Morning" banner.** Painted at row 0 of the connect-time splash and row 1 of `LogonPrompt` (when `enforce_secure_login=yes`) (Turquoise intense, centred; replaces the legacy `Welcome to BRICKS HH:MM:SS` banner when set), and retrievable programmatically via `EXEC CICS INQUIRE SYSTEM GMMTEXT(var)`. **Hard caps:** max 256 bytes, and EBCDIC-037 printable bytes only (`0x20..0x7E` minus the `[ ] { } ~ \ ` `` ` `` `\| ^` deny-set per the 3270-printables memory) — any violation is a startup error, **not** a silent substitute. An empty `gmtext=` line **restores the default** (matches the `ntp_server=on` aliasing precedent). The full 256-byte value is preserved through the verb — the LogonPrompt renderer truncates to `cols-1` only at paint time, so programs reading `GMMTEXT` see the full configured value regardless of screen width. See [PROGRAMMING.md / INQUIRE SYSTEM](PROGRAMMING.md#system-inquiry--inquire-system) for the verb and bricks deviations. |
+| `dns_name`                   | (none)                        | **Bind address.** Every bricks listener — the plain-TCP and TLS 3270 listeners, and the web3270 / `/metrics` HTTP services — binds **only** to the single IP this name resolves to (a literal IP is used as-is; a hostname resolves to one address, IPv4 preferred). A `dns_name` that is set but unresolvable is a fatal startup error. When `dns_name` is **empty**, listeners fall back to binding *all* interfaces (`0.0.0.0`) and bricks logs a `WARNING` — set `dns_name` to confine the server to one interface. |
 | `start_web3270`              | `no`                          | `yes` enables the in-process browser-based 3270 emulator. |
 | `web3270_port`               | `9000`                        | HTTP port for the web3270 frontend (only used when `start_web3270=yes`). |
-| `start_metrics`              | `yes`                         | `yes` exposes a JSON `/metrics` endpoint with runtime + counter snapshots. Independent of `start_web3270`. |
+| `start_metrics`              | `yes`                         | `yes` exposes a JSON `/metrics` endpoint with runtime + counter snapshots. Independent of `start_web3270`. Admin operators can flip the endpoint on/off at runtime via `CEMT PERFORM METRICS` without rewriting `bricks.cnf`. |
 | `metrics_port`               | `9100`                        | HTTP port for the dedicated `/metrics` listener. The same route is also mounted on the web3270 listener when both are on. |
+| `enable_wapi`                | `no`                          | `yes` enables the WAPI listener — the inbound-HTTP server that turns each matched request into a transaction dispatch via the `EXEC CICS WEB *` verbs (Phase 1 — server side). On startup bricks logs `WAPI listening on http://<host>:<port>/ (routes_file=…, N route(s) loaded)` (and a second `https://…` line when TLS opens). Off by default — no HTTP listener opens unless the operator opts in. Port defaults below apply unless overridden. |
+| `enforce_wapi_tls`           | `no`                          | `yes` suppresses the plain HTTP listener — only the HTTPS port opens. Requires `tlscert` and `tlskey` to be set (rejected at startup otherwise). Use this for any deployment where the API is reachable from outside `localhost` so credentials and payloads aren't sniffable. |
+| `wapi_port`                  | `8080`                        | TCP port for the **plain (non-TLS)** inbound EXEC CICS WEB listener. Bound to `dns_name` like every other bricks listener. Suppressed entirely when `enforce_wapi_tls=yes`. (`web_port` is accepted as a back-compat alias for the same field.) |
+| `wapi_tls_port`              | `443`                         | TCP port for the **TLS** inbound EXEC CICS WEB listener. Opens whenever `enable_wapi=yes` AND `tlscert`/`tlskey` are set — the same cert/key as the 3270 TLS listener. The standard 443 is the default; on macOS / Linux bricks needs `CAP_NET_BIND_SERVICE` or root to bind it. Use `1443` / `8443` / etc. when running unprivileged. |
+| `web_routes_file`            | `runtime/web_routes.conf`     | URIMAP-equivalent file. One row per route: `METHOD PATH-PATTERN TRANSID [groups] [response_timeout]`. `{name}` placeholders in the path are exposed to the transaction via `WEB READ QUERYPARM('name')`. Bad rows are skipped with a warning; bricks still starts. Hot-reload on mtime change. |
+| `web_request_max_bytes`      | `1048576` (1 MiB)             | Hard cap on inbound body size — anything above returns 413. |
+| `web_request_timeout`        | `30s`                         | Per-request total wall-clock cap. Accepts Go duration syntax (`5s`, `100ms`) or a bare integer (seconds). |
+| `web_header_max_bytes`       | `65536`                       | Cap on combined inbound header size — protects against header-bomb attacks. |
+| `web_client_timeout`         | `30s`                         | Per-outbound-request total wall-clock cap on the shared `*http.Client` driving `EXEC CICS WEB OPEN / CONVERSE / SEND / RECEIVE / CLOSE`. Go duration (`5s`, `100ms`) or bare integer seconds. `0` / `off` disables (no cap). |
+| `web_client_max_idle_conns`  | `32`                          | Idle-connection pool size for the outbound `*http.Transport`. Per-host limit is the same value, so 32 hosts × 32 idle conns is the worst-case pool. |
+| `web_client_tls_skip_verify` | `no`                          | `yes` accepts ANY TLS certificate on outbound HTTPS — test-only escape hatch for self-signed endpoints. Logs a loud `WARNING` at startup. Never use in production. |
+| `web_client_ca_bundle`       | (none)                        | Path to a PEM file of trusted CAs to use for outbound TLS verification **instead of** the host system's trust store. Useful when bricks must trust an internal CA that's not installed system-wide. |
+| `web_client_cert` / `web_client_key` | (none)                | PEM client-certificate + key for outbound mTLS — presented when an upstream service requires the caller to authenticate with a certificate (e.g. partner APIs gated by mTLS). Both must be set together; either alone is a startup error. |
+| `web_inbound_client_ca`      | (none)                        | PEM CA bundle for **inbound mTLS**. When set, the WAPI TLS listener requires every client to present a certificate signed by this CA — handshakes from clients without an accepted cert are rejected at the TLS layer (no transaction dispatch happens). The dispatched program reads the verified peer cert via `EXEC CICS WEB EXTRACT CERTIFICATE` (see [`DFHWBCC.cpy`](runtime/cobolcopy/DFHWBCC.cpy)). Plain (non-TLS) listeners ignore this knob. |
 | `db_host`                    | (none)                        | Postgres server hostname. Empty means SQL is not configured — bricks runs normally; `EXEC SQL` paths return SQLCODE = -1. See [SQL support](#sql-support). |
 | `db_port`                    | `5432`                        | Postgres server TCP port. |
 | `db_user`                    | (none)                        | Postgres login. |
@@ -117,6 +166,181 @@ Command-line flags (in addition to `--conf`):
 | Flag             | Notes |
 |------------------|-------|
 | `--no-console`   | Disable the framed operator console; emit raw `log.Printf` lines on stderr. Use under `nohup` / `systemd` / when piping through `tee`. |
+
+---
+
+## WAPI routing — URL → TRANSID → program
+
+Once `enable_wapi=yes` is set, the inbound listener resolves an
+incoming HTTP request through **two operator-editable layers**.
+Nothing is hard-wired — adding a new web application is one row
+per layer, no code changes, no restart (both files reload on
+mtime change).
+
+```
+HTTP request
+    │
+    ▼
+runtime/web_routes.conf      ── URL pattern → 4-character TRANSID
+    │
+    ▼
+runtime/transactions.conf    ── TRANSID → program file + ACL groups
+    │
+    ▼
+runtime/rexx/*.rexx | runtime/cobol/*.cob       ── the program that runs
+```
+
+A four-app example mixing REST GET, REST POST, browse, and an
+admin endpoint, in both REXX and COBOL:
+
+**`runtime/web_routes.conf`** (URL → TRANSID):
+
+```
+# method  path-pattern         transid  [groups]   [response_timeout]
+GET       /api/customer/{id}   WAPI     public
+POST      /api/customer        WAPC     admin
+GET       /api/orders/{id}     OAPI     users
+DELETE    /admin/cache/{key}   CACR     admin                 5s
+```
+
+**`runtime/transactions.conf`** (TRANSID → program + ACL):
+
+```
+WAPI:rexx:wapi.rexx:public,users,admin
+WAPC:cobol:wapic.cob:admin
+OAPI:rexx:orders.rexx:users,admin
+CACR:cobol:cacheclr.cob:admin
+```
+
+Each TRANSID is reachable from **both** front doors with no
+extra wiring: a 3270 operator who types `WAPI` at the prompt runs
+the exact same program that an HTTP `GET /api/customer/{id}`
+request reaches. The transaction can tell which front door it's
+serving by checking whether the `EXEC CICS WEB *` verbs return
+data — they all return `INVREQ` on a 3270 dispatch — but most
+programs don't need to: a transaction written for the 3270
+naturally renders maps, and a transaction written for HTTP
+naturally calls `WEB SEND`. Each side just doesn't reach the
+other's verbs.
+
+Live hot-reload — add a row to either file, save, hit the URL.
+A bad row in `web_routes.conf` logs `web_routes.conf:N: skipping:
+…` and is dropped; the surrounding good rows keep working
+(opt-in ACL — see [Per-transaction ACL](#per-transaction-acl) —
+applies to web rows too).
+
+When you have hundreds of web applications, the two files just
+grow longer; nothing about the dispatch path changes. CEMT
+INQUIRE TRANSACTION pages through every transaction regardless
+of which front door reaches it; `CEMT INQUIRE WEB` (Phase 3) will
+do the same for routes.
+
+### URIMAP — named outbound endpoints
+
+A URIMAP entry in `runtime/web_routes.conf` defines a named
+upstream service that outbound transactions reference by symbol
+instead of hardcoded host/port/scheme. Real CICS uses URIMAPs
+for the same purpose; the layered name → endpoint indirection
+lets one row swap an entire fleet of programs to a new
+upstream without code changes.
+
+```
+# Format: URIMAP NAME scheme://host[:port][/path-prefix]
+URIMAP   GITHUB    https://api.github.com
+URIMAP   WEATHER   https://api.openweathermap.org/data/2.5
+URIMAP   INTRANET  https://api.internal:8443/v1
+```
+
+A program calls `EXEC CICS WEB OPEN URIMAP('GITHUB') SESSTOKEN(t)`
+to resolve scheme/host/port from the named entry; the optional
+path-prefix is recorded on the session and prepended to every
+subsequent `WEB SEND` / `WEB CONVERSE` PATH. Operators can
+inspect the loaded entries via `CEMT INQUIRE URIMAP`, and the
+active inbound requests via `CEMT INQUIRE WEB`.
+
+URIMAP rows load even when `enable_wapi=no` — the outbound-only
+deployment (programs call external services, no inbound HTTP
+listener) is fully supported.
+
+Operators edit the URIMAP catalogue live from the 3270 console:
+`CEDA URIMAP` lists every loaded row and accepts an `A` (alter) /
+`D` (delete) selector per row, plus PF6 to define a new entry.
+The editor uses the same mtime-guarded optimistic-concurrency
+check the other CEDA screens use — if `web_routes.conf` was
+modified externally between read and write, the screen reports
+`file changed under us -- press ENTER to refresh` and the row is
+not touched. Every successful change emits an audit line in the
+bricks log (`ceda=URIMAP op=DEFINE …`), so the change history is
+greppable.
+
+### Inbound mTLS — verifying the caller's certificate
+
+Set `web_inbound_client_ca=ca.pem` to require every HTTPS client
+to present a certificate signed by `ca.pem`. The TLS handshake
+rejects unauthenticated clients before they ever reach a route
+handler — no `WEB *` verb runs, no transaction is dispatched.
+
+Inside a dispatched program, `EXEC CICS WEB EXTRACT CERTIFICATE`
+reads the verified peer cert into WORKING-STORAGE:
+
+```cobol
+       COPY DFHWBCC.   *> DFH-WB-CN, DFH-WB-ORG, DFH-WB-CO,
+                       *> DFH-WB-SERIAL, DFH-WB-ISSUER, …
+       EXEC CICS WEB EXTRACT CERTIFICATE
+                       COMMONNAME(DFH-WB-CN)
+                       ORGANISATION(DFH-WB-ORG)
+                       COUNTRY(DFH-WB-CO)
+                       SERIALNUM(DFH-WB-SERIAL)
+                       ISSUER(DFH-WB-ISSUER)
+       END-EXEC.
+       EVALUATE EIBRESP
+           WHEN DFHRESP(NORMAL)  ...   *> use the fields
+           WHEN DFHRESP(NOTFND)  ...   *> non-TLS or no client cert
+       END-EVALUATE.
+```
+
+`NOTFND` is returned on plain (non-TLS) requests and on TLS
+requests where no client cert was presented — useful when one
+TRANSID serves both authenticated and anonymous callers.
+
+### Outbound HTTP — calling external APIs from a transaction
+
+The other half of `EXEC CICS WEB *` is **outbound** — a bricks
+transaction calling an HTTP API on a remote host. No `bricks.cnf`
+toggle is needed; the outbound client is always available. Bricks
+builds a single shared `*http.Client` at startup with the
+`web_client_*` knobs above (timeout, idle-pool size, TLS-verify
+escape hatch); every task reuses it.
+
+The verb set is small: `WEB OPEN` (open a logical session and
+return a `SESSTOKEN`), `WEB CONVERSE` (one-shot send + receive),
+`WEB SEND` / `WEB RECEIVE` (the split form), and `WEB CLOSE`.
+Sessions left open at task end are auto-closed by the dispatcher.
+
+The shipped COBOL sample (`runtime/cobol/wzen.cob`, TRANSID
+`WZEN`) fetches GitHub's public `/zen` endpoint over HTTPS and
+displays the one-line reply on a 3270 map. Trace through it for
+the canonical "make an HTTPS call from CICS" pattern:
+
+```
+EXEC CICS WEB OPEN HOST('api.github.com') PORT(443)
+                   SCHEME('HTTPS')
+                   SESSTOKEN(DFH-WB-SESS) END-EXEC.
+
+EXEC CICS WEB CONVERSE SESSTOKEN(DFH-WB-SESS)
+                       METHOD('GET') PATH('/zen')
+                       INTO(BODY)
+                       STATUSCODE(STAT) END-EXEC.
+
+EXEC CICS WEB CLOSE SESSTOKEN(DFH-WB-SESS) END-EXEC.
+```
+
+Sign on with `CSSN` → `admin` / `admin`, type `WZEN`, press
+ENTER — within `web_client_timeout` (30 s by default) the
+program returns with the body in `BODY` and the HTTP status in
+`STAT`. The system's CA bundle validates the api.github.com cert
+automatically; no TLS configuration is required for outbound
+HTTPS to a normal public endpoint.
 
 ---
 
@@ -203,8 +427,15 @@ without needing an entry in `transactions.conf`:
 
 | Group | Gate |
 |---|---|
-| `admin` | Required for the `CEMT CONTROLBLOCKS` / `PERFORM` sub-trees and the entire `CEDA` transaction. |
-| `dev` | Required for the `ISPF` source editor — see [ISPF — built-in source editor](#ispf--built-in-source-editor) and the operator manual at [`ISPF_editor.md`](ISPF_editor.md). A user without `dev` who types `ISPF` at the prompt gets `ISPF requires DEV group membership.` and is returned to the prompt. |
+| `admin` | Required for the `CEMT CONTROLBLOCKS` / `PERFORM` sub-trees and the entire `CEDA` / `IDCA` transactions. |
+| `dev` | Required for the `ISPF` source editor and `CECI` command-level interpreter — see [ISPF — built-in source editor](#ispf--built-in-source-editor), [CECI — command-level interpreter](#ceci--command-level-interpreter), and the operator manual at [`ISPF_editor.md`](ISPF_editor.md). A user without `dev` who types `ISPF` at the prompt gets `ISPF requires DEV group membership.` and is returned to the prompt. |
+
+The same group ACL applies uniformly to `EXEC CICS LINK` and `XCTL`
+into a built-in: a low-privilege transaction attempting
+`LINK PROGRAM('ISPF')` (DEV-only) or `LINK PROGRAM('CEDA')`
+(admin-only) sees `PGMIDERR` via `EIBRESP`, with no refusal-paint
+hijacking the caller's screen. The dispatcher boundary check fires
+before the built-in's `Run` is reached.
 
 Anything else (`users`, `ops`, `qa`, …) is yours to define and use in
 the per-transaction ACL column of `runtime/transactions.conf`.
@@ -223,13 +454,16 @@ The script refuses to overwrite an existing user without `--update`.
 
 ## Per-transaction ACL
 
-`runtime/transactions.conf` accepts an **optional last field** —
+`runtime/transactions.conf` accepts an **optional 4th field** —
 comma-separated, case-insensitive group names — that gates dispatch
-per transaction. Format:
+per transaction. The full row grammar is:
 
 ```
-transid:type:program[:groups]
+transid:type:program[:groups[:database]]
 ```
+
+(the 5th field is the EXEC SQL database binding documented later
+in this README under [SQL support](#sql-support).)
 
 Three-field entries keep the legacy behaviour: `enforce_secure_login`
 in `bricks.cnf` is the only check (so a signed-on user can run
@@ -553,6 +787,31 @@ reference is in
 and the worked walk-through is in
 [Chapter 27, example E](PROGRAMMING.md#e-sequential-import-via-readq-td--write-file).
 
+**Non-FIFO access via `STARTBR`.** The same `tmp_dir` files are also
+browsable via `STARTBR` / `READNEXT` / `READPREV` / `RESETBR` /
+`ENDBR` and direct `READ FILE … RIDFLD(rba)`. Bricks deviations from
+real-CICS ESDS:
+
+* RBA is **decimal text**, not a 4-byte binary fullword.
+* Record boundary is **LF**, not a fixed-length record or RDW.
+* `STARTBR` `RIDFLD` is **optional** (defaults to BOF / RBA 0).
+* `STARTBR` / `READ FILE` with a mid-line RBA **rounds backward** to
+  the prior LF+1 so the operator gets the containing record.
+* `LENGTH(var)` on `READNEXT` / `READPREV` / `READ FILE` is
+  **input bound + output actual**: a record exceeding the buffer
+  truncates and returns `LENGERR`, with `LENGTH` rewritten to the
+  un-truncated record length. (Distinct from the KSDS path, where
+  `LENGTH` is output-only — see PROGRAMMING.md Chapter 8a for the
+  rationale.)
+* `WRITE` / `REWRITE` / `DELETE FILE` against a `tmp_dir` name
+  return `INVREQ` with the documented "use WRITEQ TD / DELETEQ TD"
+  hint — sequential files mutate only through the queue verbs.
+* A concurrent `WRITEQ TD` append IS visible mid-browse
+  (Stat-refresh-on-EOF). Real CICS holds a frozen view at `STARTBR`
+  time.
+
+Full reference: [PROGRAMMING.md, Chapter 8a](PROGRAMMING.md#chapter-8a-file-control-on-tmp_dir-sequential-files).
+
 ---
 
 ## Time synchronisation
@@ -579,14 +838,15 @@ ntp: initial sync failed (time.google.com): dial: timeout -- continuing with hos
 
 The returned offset is stored in an `atomic.Int64` and applied to
 every `Clock.Now()` call. A background goroutine repeats the query
-every 5 minutes; each result is logged the same way.
+every 12 hours; each result is logged the same way.
 
 **Important: NTP failures are non-fatal.** If the server is
 unreachable, returns garbage, or DNS fails, bricks logs one console
 line and continues serving transactions. The previous successful
 offset stays in effect (or zero on first failure, meaning bricks
-falls back to the raw host clock). The 5-minute ticker retries
-automatically.
+falls back to the raw host clock). The 12-hour ticker retries
+automatically — for one-off forced syncs in the meantime, restart
+bricks (the initial sync runs synchronously at startup).
 
 Bricks **never** sets the host OS clock — that would require root
 and break the pure-Go / OS-independent guarantee. The offset is
@@ -753,6 +1013,16 @@ SQLD:cobol:sqld.cob:public                  # default db
 ORDQ:cobol:ordq.cob:public:orders           # orders db
 LEDQ:cobol:ledq.cob:admin,users:ledger      # ledger db, ACL'd
 ```
+
+A program that runs `EXEC SQL` against a non-default database
+**must** list the binding explicitly. Omitting the 5th field
+sends every statement to the first row of `databases.conf`; if
+the target table doesn't live there, the operator sees
+`SQLCODE=-204 relation "..." does not exist` immediately, then
+`SQLCODE=-100 SQLSTATE=25P02 current transaction is aborted` on
+every subsequent statement of the same task. See
+[PROGRAMMING.md Chapter 26 — *Database binding*](PROGRAMMING.md#database-binding-transactionsconf-5th-field)
+for the full contract.
 
 Adding a row to `databases.conf` (or CEDA DATABASE `A`) **only**
 tells bricks about the database; it doesn't yet exist in
@@ -963,6 +1233,144 @@ and risks) is in [`ispf_plan.md`](ispf_plan.md). The source layout:
 
 ---
 
+## CECI — command-level interpreter
+
+`CECI` is a built-in TRANSID (no entry in `transactions.conf`,
+implemented in package `ceci/`) that lets developers type a single
+`EXEC CICS`, `EXEC SQL`, or `EXEC WEB` command and see the response
+on the screen. Like ISPF it is restricted to users who belong to the
+**`dev`** group in `runtime/users.conf`; everyone else gets
+`CECI requires DEV group membership.` and a return to the blank
+prompt.
+
+The same DEV-group gate fires for `EXEC CICS LINK PROGRAM('CECI')`
+and `EXEC CICS XCTL PROGRAM('CECI')`. A non-DEV caller attempting
+either gets `PGMIDERR` (via `EIBRESP`) on the LINK and a 403
+task-error screen on the XCTL — no refusal paint reaches the
+caller's terminal.
+
+```
+CECI                                                      TERM=T0001  14:30:42
+> exec cics asktime abstime(t)
+>
+>
+>
+>
+RESPONSE:  NORMAL(0)    RESP2: 0      LEN: 46      ELAPSED: 0.044msec
+EIBDATE=0126151
+EIBTIME=143042
+T=003989219027483
+(blank result rows)
+PF 3 END   5 PROCESS   7 SCROLL UP   8 SCROLL DOWN   PA1 BREAK
+```
+
+The screen has three zones:
+
+1. **Input zone (rows 1–5).** Five writable rows, each marked with a
+   green `>` indicator at the left edge. Type the command across as
+   many rows as needed; rows that end in `(` or `,` are joined to the
+   next row without a space (mid-token continuation), otherwise rows
+   are joined with one space. A leading `EXEC CICS` / `EXEC WEB` /
+   `EXEC SQL` is stripped before parsing, so both styles work.
+
+2. **Response line (row 6).** Shows the dispatch outcome as
+   `RESPONSE: NAME(rc)   RESP2: n   LEN: n   ELAPSED: d.dddmsec`.
+   The `NAME(rc)` slot carries `NORMAL(0)` in white intense on
+   success, the IBM condition name (`NOTFND`, `INVREQ`, etc.) in
+   red on a non-NORMAL return, and one of `SYNTAX`, `DENIED`,
+   `TIMEOUT`, `BADCHAR`, `NOSQL` in red for the corresponding
+   early-return paths. Mutating verbs that succeed render
+   `NORMAL(0)` in yellow intense so the operator notices the
+   commit.
+
+3. **Result pane (rows 7..R-2).** Variables the handler set during
+   the call (`T=003989...`), `INTO`/`SET` buffer hex dumps,
+   and any error detail (lines starting with `! `). The pane is
+   cleared at the top of every PF5 press so each run's output
+   replaces the previous run's output rather than appending.
+   Scrolls with PF7 / PF8.
+
+| Key | Action |
+|---|---|
+| `PF5` | Execute the current input |
+| `PF3` | Exit CECI |
+| `PF7` | Page down through the result pane |
+| `PF8` | Page up through the result pane |
+| `PA1` | Break out (also exits CECI) |
+
+**Session-scoped transaction lifetime.** The `TxCB` and `cics.Handler`
+are built ONCE when the operator enters CECI and torn down on `PF3` /
+`CLEAR` / `PA1` / disconnect — not between PF5 presses. Each `PF5`
+press is just an implicit commit boundary: `h.CommitImplicit()` on a
+successful verb, `h.RollbackImplicit()` on failure. SYNCPOINT in
+bricks does NOT touch cursors, so all cursor-shaped state — the
+per-task TS read cursor, every open browse, every TD handle, every
+outbound WEB session, every DOCUMENT token — survives the per-PF5
+commit and remains usable on the next press. The session-end defer
+runs `CloseBrowses` / `CloseAllTD` / `CloseWebSessions` /
+`CloseAllDocs` / `ReleaseAllLocks` / `Registry.EndTxn` exactly once,
+on the way out. Consequence: a file `READ UPDATE` followed by
+`REWRITE` still cannot span two PF5 presses — the per-PF5 implicit
+SYNCPOINT releases non-`HOLD` record locks. See the
+[`READ UPDATE` + `REWRITE` deviation note](PROGRAMMING.md#rewrite)
+in `PROGRAMMING.md` for the recommended workaround (type both verbs
+on one PF5 input, or wrap with `ENQ resource HOLD … DEQ resource`).
+On a 7-second cap-hit the session is *poisoned*: every subsequent
+`PF5` short-circuits with `TIMEOUT` and the session-end defer skips
+its handler-owned closers to avoid racing the abandoned goroutine.
+`PF3` is the only path out of a poisoned session.
+
+**Session-scoped variable frame.** A simple in-memory map satisfies
+the `cics.Frame` contract; variables the handler `Set()` persist for
+the whole CECI session, so a sequence like
+`READ FILE('CUSTOMERS') RIDFLD('00001') INTO(REC) RESP(RC)` populates
+`REC` and `RC`, and the next command can reference them. The frame
+is cleared when CECI exits, not when a command runs.
+
+**Verb policy.** CECI rejects verbs that would mangle the shell
+itself:
+
+- **Flow-altering:** `RETURN`, `XCTL`, `LINK`, `ABEND` would unwind
+  the CECI task.
+- **Screen-stealing:** `SEND MAP`, `SEND TEXT`, `SEND CONTROL`,
+  `RECEIVE MAP`, `CONVERSE` would repaint CECI's own screen.
+- **Task-life:** `START`, `RETRIEVE`, `CANCEL`, `DELAY` have no live
+  task to receive deferred work or block in.
+- **Trap tables:** `HANDLE`, `IGNORE`, `WHENEVER` set per-task trap
+  state that would not survive the per-PF5 handler teardown.
+- **Rollback:** `SYNCPOINT ROLLBACK` is meaningless — the per-PF5
+  TxCB auto-commits at end-of-press.
+
+`ENQ` is auto-rewritten with `NOSUSPEND` so a typed-in lock cannot
+wedge the CECI session for the full 5-minute ENQ wait. Mutating
+verbs that pass policy (`WRITE`, `REWRITE`, `DELETE`, `WRITEQ TS/TD`,
+`WEB SEND` / `WEB RECEIVE` / etc.) commit at end-of-PF5 and the
+RESPONSE line paints `NORMAL(0)` in yellow as the visible warning.
+
+**Wall-clock cap.** Every command runs under a 7-second timeout.
+On cap-hit the RESPONSE line shows `TIMEOUT` in red and the
+abandoned goroutine is left to drain; CECI's defer chain skips
+the handler closers on the timeout path to avoid racing the
+in-flight call.
+
+**EBCDIC 037 character discipline.** The shell rejects input rows
+containing characters outside EBCDIC code page 037 (`[`, `]`, `{`,
+`}`, `~`, `\`, backtick, `|`, `^`) with a `BADCHAR` response — these
+characters do not render on a real 3270 terminal.
+
+The source layout:
+
+| File | What |
+|---|---|
+| `ceci/ceci.go` | `TransID`, `Deps`, `Run` AID loop, per-PF5 `executeOnce`, 7-second timeout race. |
+| `ceci/screen.go` | Layout primitives, RESPONSE-line composition, EBCDIC input audit. |
+| `ceci/frame.go` | Map-backed `cics.Frame` implementation. |
+| `ceci/policy.go` | Verb deny / soft-warn lists; ENQ auto-NOSUSPEND rewrite. |
+| `ceci/result.go` | Scrollable result buffer with wrap, head-trim, hex/ASCII dump. |
+| `txn/ceci.go` | `Dispatcher.runCECI` — DEV-group gate + `Deps` construction. |
+
+---
+
 ## CEMT — master-operator transaction
 
 `CEMT` is a built-in TRANSID (no entry needed in `transactions.conf`,
@@ -1011,7 +1419,37 @@ C  CONTROLBLOCKS   TCBs / UCBs / TXCBs / FCBs (admin)
 
 Each detail screen renders a fixed-width table. Columns are auto-sized
 to the widest value, with a fallback to ellipsis when the row would
-overflow. PF3 exits the screen, ENTER refreshes counters in place.
+overflow. Every INQUIRE screen sorts rows alphabetically by the
+first column (TRANSID, TERMID, FILE, USERID, …) so a long list reads
+in operator-friendly order. PF3 exits the screen, ENTER refreshes
+counters in place.
+
+`CEMT INQUIRE USER` further colour-codes its rows so the four
+categories of "user" jump out at a glance:
+
+* **Red** — connected AND signed-on (a UCB exists for the userid).
+  The `TERMS` column lists every TermID this user is on, so one user
+  with two open sessions collapses into one row (`T0001,T0002`).
+* **Pink** — connected but NOT signed-on. One pink row per
+  unauthenticated TCB, USERID `(none)`, with the TermID in `TERMS`.
+  Two anonymous connections produce two pink rows.
+* **Turquoise** — previously signed-on this process but now
+  disconnected. Pulled from an in-memory gone-cache that snapshots
+  every UCB the registry drops; sorted newest-first by `LASTLOGIN`.
+  Re-signing-on the same userid removes the entry so nothing is shown
+  twice.
+* **Yellow** — defined in `users.conf` but not seen this process.
+  Rendered at the bottom so admins have the full catalogue in front of
+  them when switching to `CEDA USER` to alter or define entries.
+
+Each userid appears at most once across the four tiers. The
+`TERMS` column sits at the right end of the row and absorbs
+whatever screen width is left after the fixed columns; TermIDs are
+appended comma-separated until adding the next one would push past
+the right margin, at which point the list simply stops.
+
+The gone-cache is purely in-memory — bricks restart clears it and no
+login is ever written to disk by this screen.
 
 ### CEMT MONITOR
 
@@ -1046,19 +1484,22 @@ what used to be `CEMT P PERFORMANCE`:
 
 ### CEMT PERFORM
 
-The TS-queue purge screen (which used to live under the old `CEMT C S`)
-plus the diagnostic rescans grouped under their own sub-branch:
+The diagnostic rescans plus the live program- and map-cache
+controls grouped under one admin sub-branch:
 
 ```
-U  PURGE     (N queues -- type P to purge) -- TS queue purge selector
-R  RESCAN    trans / maps / programs       -- on-disk diagnostic scans
+M  MAPCACHE        (N/M entries)                  -- resize / inspect the map LRU
+R  RESCAN    trans / maps / programs              -- on-disk diagnostic scans
    ├── T  TRANS     (N transactions, M missing)   -- rescan transactions.conf
    ├── M  MAP       (N maps, M syntax errors)     -- parse every *.map in MapsDir
    └── P  PROGRAMS  (N programs, M orphans)       -- walk rexx_dir + cobol_dir
+C  PROGRAMCACHE   (L1 N/M, L2 N MB)               -- resize / inspect the program cache
+E  METRICS        (enabled|disabled, N scrapes)   -- toggle /metrics endpoint
 ```
 
-* **PERFORM PURGE** (`CEMT P U`) is the TS-queue list with a per-row
-  P-selector and a confirmation overlay (was `CEMT C S`).
+(TS-queue purge moved to `CEDA QUEUES` — purges live alongside the
+other CEDA mutations.)
+
 * **RESCAN TRANS** (`CEMT P R T`) re-stats every program path declared
   in `runtime/transactions.conf` and renders TRANSID / LANG / PROGRAM /
   STATUS / PATH. STATUS is `OK` when the file is present, `MISSING` when
@@ -1078,6 +1519,34 @@ R  RESCAN    trans / maps / programs       -- on-disk diagnostic scans
   lists every regular file, and shows the TRANSIDs in
   `transactions.conf` that reference it. Files with no matching
   TRANSID render with TRANSID=`-` so stale leftovers stand out.
+* **MAPCACHE** (`CEMT P M`) shows the live counters for the parsed-
+  map LRU set by `map_cache` in `bricks.cnf`: capacity, current
+  occupancy, hits / misses / hit-ratio, and eviction count. The one
+  writable cell takes a new capacity (`1..1028`); PF5 applies it
+  immediately. Shrinking evicts the LRU overflow in place; counters
+  survive the resize so the hit-ratio stays meaningful across an
+  operator adjustment. Saturated occupancy paired with a steady
+  eviction stream is the signal that the cap should be raised.
+* **PROGRAMCACHE** (`CEMT P C`) is the parallel screen for the
+  REXX/COBOL program cache — see the dedicated section under
+  "Performance and security hardening" for the L1/L2 details.
+* **METRICS** (`CEMT P E`) is the admin runtime toggle for the
+  `/metrics` JSON endpoint. The top half of the screen shows live
+  state (ENABLED / DISABLED, the endpoint URL, process uptime); a
+  two-column counter grid lists SCRAPES, ERRORS, BYTES SERVED,
+  IN FLIGHT, LAST STATUS, LAST SCRAPE, LAST BYTES, LAST DURATION,
+  RATE per-second, and AVG bytes / scrape. The one writable cell
+  accepts `Y` (enable) or `N` (disable); PF5 applies and is
+  highlighted red on the footer to mark it as the commit key.
+  When disabled, every scrape returns `503 Service
+  Unavailable` immediately and the handler skips the
+  `runtime.ReadMemStats` probe — that probe is a stop-the-world
+  GC sample, so a deployment with no scraper attached can park
+  the endpoint and save real CPU without restarting bricks.
+  Counters keep advancing while disabled, so an operator can see
+  whether a stale scraper is still trying to reach the endpoint.
+  Toggling is admin-only and survives until the next process
+  restart (it does NOT rewrite `start_metrics` in `bricks.cnf`).
 
 ---
 
@@ -1085,24 +1554,25 @@ R  RESCAN    trans / maps / programs       -- on-disk diagnostic scans
 
 `CEDA` is a separate built-in TRANSID (no entry needed in
 `transactions.conf`, implemented alongside CEMT in package `cemt/`).
-It is **admin-only** end-to-end. The three screens cover the
-mutation surfaces that actually matter for a bricks deployment — the
-user database, the transaction table, and the program load library
-on disk:
+It is **admin-only** end-to-end. Every mutation surface that matters
+for a bricks deployment — users, transactions, programs on disk,
+SQL databases, VSAM files, and TS queues — lives under CEDA:
 
 ```
-+-----------------------------------------------------------+
-| BRICKS Transaction Server  •  CEDA — resource definitions |
-|                                                           |
-|   Pick an option and press ENTER. PF3 to back out.        |
-|                                                           |
-|     U  USER         (N users)                             |
-|     T  TRANSACTION  (N transactions)                      |
-|     P  PROGRAM      (N REXX, M COBOL on disk)             |
-|     Q  QUIT         (or press PF3)                        |
-|                                                           |
-|   Choice: _                                               |
-+-----------------------------------------------------------+
++--------------------------------------------------------------+
+| BRICKS Transaction Server  •  CEDA — resource definitions    |
+|                                                              |
+|   Pick an option and press ENTER. PF3 to back out.           |
+|                                                              |
+|     U  USER         (N users)                                |
+|     T  TRANSACTION  (N transactions)                         |
+|     P  PROGRAM      (N REXX, M COBOL on disk)                |
+|     D  DATABASE     (N databases)                            |
+|     V  VSAM         (N VSAM files)                           |
+|     Q  QUEUES       (N queues -- type P to purge)            |
+|                                                              |
+|   Choice: _                                                  |
++--------------------------------------------------------------+
 ```
 
 CEDA shares CEMT's title bar, palette, and `pagedTable` layout — so
@@ -1115,8 +1585,8 @@ unambiguous-prefix matcher.
 Real CICS CEDA's Groups / Lists / INSTALL / COPY / CHECK
 abstractions are intentionally absent — bricks already collapses
 CEDA's "definition + install" cycle into "edit text file,
-hot-reload" — so this is a focused three-screen tool, not a
-verbatim CICS port.
+hot-reload" — so this is a focused resource-management tool, not
+a verbatim CICS port.
 
 * **CEDA USER** (`CEDA U`) lists every user from `users.conf` with a
   per-row `SEL` cell. Type `A` to ALTER, `D` to DELETE, press ENTER to
@@ -1179,6 +1649,59 @@ ceda=USER op=DEFINE target=test1 detail="USERS" term=T0001 user=admin
 ceda=TRANS op=ALTER target=HELO detail="rexx hello.rexx" term=T0001 user=admin
 ```
 
+### CEDA VSAM
+
+`CEDA VSAM` — any abbreviation works: `CEDA V`, `CEDA VS`,
+`CEDA VSA` all reach it via the same unambiguous-prefix matcher —
+opens the VSAM file catalogue. It lists every KSDS file inside
+`files.boltdb` with its record count, key / record maximum
+lengths, last-modified time, and a `LOCK` column showing the
+terminal holding a `READ FILE UPDATE` lock (or `-` when free).
+See [How file storage works](#how-file-storage-works) for the
+bbolt internals.
+
+The one row action is `P` (purge). Mark one or more files with
+`P` in the selector column and press ENTER; a secondary
+confirmation screen lists each selected file beside an input
+field, and a file is purged **only** when its name is re-typed
+exactly. A mismatched or blank entry drops that file from the
+purge; `PF3` cancels the whole operation. A file currently
+holding a `READ FILE UPDATE` lock is **blocked** — it is
+reported as skipped and never reaches the confirmation screen,
+so a purge can't surprise an in-flight task.
+
+Purging a file drops both its bbolt data bucket and its
+catalogue entry; it disappears from `CEMT INQUIRE FILE` as well.
+A later `WRITE FILE` re-creates it empty. Every purge — success
+or failure — is audit-logged:
+
+```
+ceda=VSAM op=PURGE target=CUSTOMERS term=T0001 user=admin status=OK
+```
+
+Like the rest of CEDA, the VSAM screen is admin-only.
+
+### CEDA QUEUES
+
+`CEDA QUEUES` — any abbreviation works (`CEDA Q`, `CEDA QU`,
+`CEDA QUEU` all reach it via the same unambiguous-prefix matcher;
+CEDA carries no `QUIT` child so Q is unambiguous, and PF3 still
+backs out of the menu) — opens the TS-queue list. Every TS queue
+currently in the data store shows one row with its ITEMS / READS
+/ WRITES / REWRT / LASTACC / STATUS counters — the same per-queue
+stats `CEMT INQUIRE TS` renders for read-only inspection.
+
+The one row action is `P` (purge). Type `P` (or `D` as an alias for
+"delete") in a row's selector cell and press ENTER; a centred
+confirmation overlay names the target queue and waits for `Y` to
+commit the `DELETEQ TS`. Anything else cancels. Only one queue can
+be marked per submit; mark more and the screen rejects the batch
+with `Type P on only one queue at a time.`
+
+Like the rest of CEDA, the QUEUES screen is admin-only. The
+read-only counterpart — `CEMT INQUIRE TS` — remains available to
+any signed-on operator.
+
 ---
 
 ## CLI utilities
@@ -1187,6 +1710,7 @@ ceda=TRANS op=ALTER target=HELO detail="rexx hello.rexx" term=T0001 user=admin
 |-----------------------------------|---------|
 | `./bricks --conf=bricks.cnf`      | Run the server. |
 | `./bricksload --help`             | Stress-test bricks; live dashboard + final report. See [Stress testing](#stress-testing--bricksload). |
+| `./bricksconvert -h`              | Convert an IBM CICS BMS map source (`DFHMSD` / `DFHMDI` / `DFHMDF`) to the bricks map DSL. See [BMS conversion](#bms-conversion--bricksconvert). |
 | `go run ./cmd/seed-customers`     | Idempotently load 250 sample customer records into the CUSTOMERS KSDS. |
 | `go run ./cmd/brickspw <pw>`      | Print a bcrypt hash for a password. |
 | `./add_brick_user.bash <u> <p> [groups]` | Add a user (refuses duplicates without `--update`). |
@@ -1462,6 +1986,153 @@ object — see `cmd/bricksload/report.go::Report` for the schema.
 
 ---
 
+## BMS conversion — `bricksconvert`
+
+`cmd/bricksconvert` is a one-way converter from IBM CICS **BMS map
+source** (the `DFHMSD` / `DFHMDI` / `DFHMDF` assembler macros) to
+the bricks map DSL (the `MAP ... ENDMAP` format parsed by
+`mapdsl/`). It is the recommended path for porting an existing
+CICS application's screens onto bricks without rewriting every
+panel by hand.
+
+### Quick start
+
+```bash
+go build -o bricksconvert ./cmd/bricksconvert    # one-time build
+
+# Mode 1 -- convert and write the result to a file.
+./bricksconvert -o runtime/map/cust1.map  legacy/cust1.bms
+
+# Mode 1b -- also emit a COBOL copybook alongside the .map.
+./bricksconvert -o runtime/map/cust1.map -copy runtime/cobolcopy/cust1.cpy \
+                legacy/cust1.bms
+
+# Mode 2 -- "check-only" -- parse + verify with no output written.
+#          Useful in CI: exits 0 iff every file converts cleanly.
+./bricksconvert -check legacy/cust1.bms
+```
+
+The tool reads one BMS source file on the command line. Exactly
+one of `-o <path>` or `-check` is required -- the converter
+refuses to run without a declared destination so a misinvocation
+can't dump the DSL onto stdout by accident.
+
+### `-copy` — generate a matching COBOL copybook
+
+Pair `-copy <path>` with `-o` to also write a COBOL copybook (`.cpy`)
+mirroring the converted map's named fields. Each BMS map becomes a
+`01 <mapname>.` group with one `05 <field> PIC X(N).` entry per
+named field (or `PIC 9(N).` when the BMS source set `ATTRB=NUM`).
+Unnamed fields (chrome / literals) are skipped; fields without a
+`LENGTH=` are skipped with a `*> WARNING:` line in the header so the
+operator notices.
+
+The COBOL program then pulls the storage in with one line:
+
+```cobol
+       WORKING-STORAGE SECTION.
+       COPY CUST1.
+       ...
+       EXEC CICS SEND MAP('CUST1') FROM(CUST1) END-EXEC.
+```
+
+`-copy` requires `-o` and refuses to combine with `-check` — the
+copybook is a by-product of a real conversion, not a check-mode
+emission. Misinvocations exit 2 with a specific message
+(`bricksconvert: -copy requires -o`).
+
+### Help, exit codes, colour
+
+```
+bricksconvert -h | -help
+```
+
+prints the concise usage block. Exit codes are operator-friendly:
+
+| Exit | Meaning |
+|---|---|
+| `0` | Conversion (or `-check`) succeeded. |
+| `1` | BMS syntax / semantic error in the source. The first offending line is shown with a dim source-line context row, file:line prefix, and the diagnostic in red. |
+| `2` | Usage error (missing arguments, both `-o` and `-check` given), I/O failure, or an internal converter bug. |
+
+Colour is on by default when stderr is a terminal; pipe through
+`less` or set `--color=never` to suppress. Set `--color=always`
+to force ANSI escapes on (useful when piping through colour-aware
+viewers).
+
+### Successful output
+
+```
+sample_bms.map: OK
+  ─── BMS vs bricks ───────────────────────
+                       BMS    bricks
+  statements           34        34
+  mapsets               1         -
+  maps                  1         1
+  size              24x80     24x80
+  fields (display)     24        24
+  inputs                7         7
+  stops                 0         0
+  cursor target    CUSTID    CUSTID
+  warnings              0         -
+  elapsed          0s.0ms
+
+  Wrote runtime/map/cust1.map.
+  runtime/map/cust1.map passes bricks parser.
+```
+
+The grid shows side-by-side counts so an operator can confirm
+the conversion preserved every logical element of the source.
+Rows that match are green; mismatches are red. The
+`bricks parser` line is the **verification step**: bricksconvert
+re-reads the just-written file from disk and runs it through
+`mapdsl.ParseReader` (the same parser the bricks runtime uses on
+every map at load time). A "passes" confirmation in green tells
+you the file is immediately deployable.
+
+### Coverage: 100% of BMS, lossy where bricks doesn't model
+
+The parser accepts every documented BMS macro and every
+attribute. Where bricks's map DSL can't represent a BMS feature
+exactly, the converter emits a `* WARNING: ...` comment line into
+the output AND bumps the `warnings` counter in the summary so
+the operator can hand-finish the result. The current warning-
+producing features are `PICIN=`, `PICOUT=` (picture-editing
+clauses), `OCCURS=` (array fields), `GRPNAME=` (field groups),
+`OUTLINE=` (box / underline / overline), `ATTRB=DET`
+(light-pen detection), and any unrecognised `ATTRB=` token.
+
+### Strict BMS column rules
+
+The lexer enforces IBM's canonical column rules: the
+continuation marker `X` must sit at exactly column 72. Lines
+where the operator placed `X` at the end of the operand list
+(say col 65 or 66) are rejected with a precise diagnostic:
+
+```
+sample.bms:1: BMS parse error: continuation marker `X` at col 66; BMS requires col 72 (pad the body to 71 chars).
+  source line 1: ORDMAPS  DFHMSD TYPE=MAP,MODE=INOUT,LANG=COBOL,                  X
+```
+
+The other "wire format" subtleties (continuation lines resume
+at col 16; cols 73-80 are sequence numbers when the line is
+exactly 80 chars; comment lines start with `*` in col 1; the
+`'don''t'` doubled-quote convention; adjacent string literal
+concatenation for long `INITIAL=` values broken across multiple
+continuation lines) are all handled automatically. See
+`cmd/bricksconvert/bms_lex.go` and `bms_parse.go` for the full
+grammar.
+
+### One BMS file → one or more bricks DSL maps
+
+A BMS mapset can hold multiple `DFHMDI`-bounded maps; the
+converter emits one `MAP ... ENDMAP` block per map, in source
+order, into a single output file. The bricks map catalogue
+(`runtime/map/*.map`) accepts that shape natively -- no need
+to split the output into one file per map.
+
+---
+
 ## Performance and security hardening
 
 ### Parsed-program cache
@@ -1576,5 +2247,14 @@ transaction between the `STARTBR` snapshot and the read. The skip is
 implemented as a bounded forward loop over the snapshot
 (`cics/files.go::readNextFile`), replacing an unbounded recursion, so no
 amount of in-flight deletes can blow the goroutine stack.
+
+## Independent Bricks Apps
+
+Third-party applications and projects built on top of bricks. Send a
+PR to add yours.
+
+| Project | Description | Author |
+|---|---|---|
+| [Minette-Codes/Bricks](https://github.com/Minette-Codes/Bricks) | App built on the bricks transaction server. | [Minette-Codes](https://github.com/Minette-Codes) |
 
 ![BRICKS](bricks.png)
