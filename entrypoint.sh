@@ -24,7 +24,10 @@ case "$(uname -m)" in
 esac
 
 find bin -maxdepth 1 -type f -name "*${OS}-${ARCH}" -print0 | \
-        xargs -0 -I{} /bin/sh -c "ln -s \$(basename "{}") bin/\$(basename "{}"| cut -d- -f1)"
+        xargs -0 -I{} /bin/sh -c "\
+            test ! -e bin/\$(basename "{}"| cut -d- -f1) && \
+            ln -s \$(basename "{}") bin/\$(basename "{}"| cut -d- -f1)"
+
 
 umask 0077
 
