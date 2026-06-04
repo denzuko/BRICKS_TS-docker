@@ -31,7 +31,7 @@ find bin -maxdepth 1 -type f -name "*${OS}-${ARCH}" -print0 | \
 
 umask 0077
 
-# ── PostgreSQL compatibility layer ──────────────────────────────────
+# ── PostgreSQL environment variable mapping ──────────────────────────
 # Maps official postgres Docker image environment variables to BRICKS
 # db_* config keys. Precedence: BRICKS_db_* > POSTGRES_* > defaults.
 #
@@ -40,47 +40,21 @@ umask 0077
 #   POSTGRES_PASSWORD
 #   POSTGRES_DB       (default: postgres)
 #
-# Non-standard vars added for compose service networking:
-#   POSTGRES_HOST     (not set by the official image; set it yourself
-#                      in the bricks service to point at the db service)
-#   POSTGRES_PORT     (optional; defaults to 5432)
+# Non-standard vars for compose service networking (not set by image):
+#   POSTGRES_HOST     set this in the bricks service to name the db service
+#   POSTGRES_PORT     optional; defaults to 5432
 #
-# BRICKS-specific override vars (take precedence over POSTGRES_*):
-#   BRICKS_db_host, BRICKS_db_port, BRICKS_db_user,
-#   BRICKS_db_password, BRICKS_db_name, BRICKS_db_sslmode
+# BRICKS-specific overrides take precedence over POSTGRES_* vars.
 BRICKS_db_host="${BRICKS_db_host:-${POSTGRES_HOST:-localhost}}"
 BRICKS_db_port="${BRICKS_db_port:-${POSTGRES_PORT:-5432}}"
 BRICKS_db_user="${BRICKS_db_user:-${POSTGRES_USER:-bricks}}"
 BRICKS_db_password="${BRICKS_db_password:-${POSTGRES_PASSWORD:-}}"
-BRICKS_db_name="${BRICKS_db_name:-${POSTGRES_DB:-bricks}}"
 BRICKS_db_sslmode="${BRICKS_db_sslmode:-disable}"
 BRICKS_db_max_conns="${BRICKS_db_max_conns:-8}"
 BRICKS_db_stmt_timeout="${BRICKS_db_stmt_timeout:-30s}"
 
-# ── Auto-apply DDL schema ────────────────────────────────────────────
-# If BRICKS_auto_init_sql is set to a path to a SQL file, apply it via
-# psql on startup. Pattern follows bank_schema.bash: PGPASSWORD export,
-# psql array with -v ON_ERROR_STOP=1. Idempotent (DDL uses IF NOT EXISTS).
-# psql is not in the base image; add it to the Dockerfile or use an
-# init container. Skips gracefully when psql is absent.
-if [ -n "${BRICKS_auto_init_sql:-}" ] && [ -f "${BRICKS_auto_init_sql}" ]; then
-    if command -v psql >/dev/null 2>&1; then
-        echo "==> Applying DDL: ${BRICKS_auto_init_sql}"
-        export PGPASSWORD="${BRICKS_db_password}"
-        psql -h "${BRICKS_db_host}" -p "${BRICKS_db_port}" \
-             -U "${BRICKS_db_user}" -d "${BRICKS_db_name}" \
-             -v ON_ERROR_STOP=1 --no-psqlrc \
-             -f "${BRICKS_auto_init_sql}" || \
-            echo "WARNING: DDL apply completed with errors -- check schema"
-        unset PGPASSWORD
-    else
-        echo "WARNING: BRICKS_auto_init_sql set but psql not found -- skipping"
-    fi
-fi
-
-# ── Generate bricks.cnf via m4 ──────────────────────────────────────
-# Maintainer Note: m4(1) is crufty but functional for now.
-#                  A cleaner path would be spf13/viper + spf13/pflag directly.
+# Configuration generator - Maintainer Note: m4(1) is crufty but functional.
+#                           A cleaner path: spf13/viper + spf13/pflag directly.
 m4 \
   -D_dns_name="${BRICKS_dns_name:-$HOSTNAME}" \
   -D_port="${BRICKS_port:-2300}" \
@@ -139,6 +113,10 @@ databases_file=runtime/databases.conf
 EOF
 
 chmod 400 bricks.cnf
+
+RUN_TLS=$(readcfg start_tls bricks.cnf)
+CERT_PATH=$(readcfg tlscert bricks.cnf)
+KEY_PATH=$(readcfg tlskey bricks.cnf)
 
 case  "$(readcfg start_tls bricks.cnf)" in
         [yY][eE][sS])  test -f "$(readcfg tlscert bricks.cnf)" || \
