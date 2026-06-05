@@ -52,6 +52,7 @@ BRICKS_db_password="${BRICKS_db_password:-${POSTGRES_PASSWORD:-}}"
 BRICKS_db_sslmode="${BRICKS_db_sslmode:-disable}"
 BRICKS_db_max_conns="${BRICKS_db_max_conns:-8}"
 BRICKS_db_stmt_timeout="${BRICKS_db_stmt_timeout:-30s}"
+BRICKS_db_file="${BRICKS_db_file:-runtime/databases.conf}"
 
 # Configuration generator - Maintainer Note: m4(1) is crufty but functional.
 #                           A cleaner path: spf13/viper + spf13/pflag directly.
@@ -75,6 +76,7 @@ m4 \
   -D_data_dir="${BRICKS_data_dir:-data}" \
   -D_users_file="${BRICKS_users_file:-runtime/users.conf}" \
   -D_transactions_file="${BRICKS_transactions_file:-runtime/transactions.conf}" \
+  -D_databases_file="${BRICKS_db_file}" \
   -D_db_host="${BRICKS_db_host}" \
   -D_db_port="${BRICKS_db_port}" \
   -D_db_user="${BRICKS_db_user}" \
@@ -102,6 +104,7 @@ copybook_dir=_copybook_dir
 data_dir=_data_dir
 users_file=_users_file
 transactions_file=_transactions_file
+databases_file=_databases_file
 db_host=_db_host
 db_port=_db_port
 db_user=_db_user
@@ -109,7 +112,6 @@ db_password=_db_password
 db_sslmode=_db_sslmode
 db_max_conns=_db_max_conns
 db_stmt_timeout=_db_stmt_timeout
-databases_file=runtime/databases.conf
 EOF
 
 chmod 400 bricks.cnf
