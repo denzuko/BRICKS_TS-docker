@@ -31,8 +31,30 @@ find bin -maxdepth 1 -type f -name "*${OS}-${ARCH}" -print0 | \
 
 umask 0077
 
-# Configuration generator - Maintainer Note: heardocs + m4(1) are crufty but maybe a better way
-#                                            is using spf13/viper and spf13/pflag directly 
+# ── PostgreSQL environment variable mapping ──────────────────────────
+# Maps official postgres Docker image environment variables to BRICKS
+# db_* config keys. Precedence: BRICKS_db_* > POSTGRES_* > defaults.
+#
+# Official postgres image vars (set by postgres:N-alpine at runtime):
+#   POSTGRES_USER     (default: postgres)
+#   POSTGRES_PASSWORD
+#   POSTGRES_DB       (default: postgres)
+#
+# Non-standard vars for compose service networking (not set by image):
+#   POSTGRES_HOST     set this in the bricks service to name the db service
+#   POSTGRES_PORT     optional; defaults to 5432
+#
+# BRICKS-specific overrides take precedence over POSTGRES_* vars.
+BRICKS_db_host="${BRICKS_db_host:-${POSTGRES_HOST:-localhost}}"
+BRICKS_db_port="${BRICKS_db_port:-${POSTGRES_PORT:-5432}}"
+BRICKS_db_user="${BRICKS_db_user:-${POSTGRES_USER:-bricks}}"
+BRICKS_db_password="${BRICKS_db_password:-${POSTGRES_PASSWORD:-}}"
+BRICKS_db_sslmode="${BRICKS_db_sslmode:-disable}"
+BRICKS_db_max_conns="${BRICKS_db_max_conns:-8}"
+BRICKS_db_stmt_timeout="${BRICKS_db_stmt_timeout:-30s}"
+
+# Configuration generator - Maintainer Note: m4(1) is crufty but functional.
+#                           A cleaner path: spf13/viper + spf13/pflag directly.
 m4 \
   -D_dns_name="${BRICKS_dns_name:-$HOSTNAME}" \
   -D_port="${BRICKS_port:-2300}" \
@@ -53,6 +75,13 @@ m4 \
   -D_data_dir="${BRICKS_data_dir:-data}" \
   -D_users_file="${BRICKS_users_file:-runtime/users.conf}" \
   -D_transactions_file="${BRICKS_transactions_file:-runtime/transactions.conf}" \
+  -D_db_host="${BRICKS_db_host}" \
+  -D_db_port="${BRICKS_db_port}" \
+  -D_db_user="${BRICKS_db_user}" \
+  -D_db_password="${BRICKS_db_password}" \
+  -D_db_sslmode="${BRICKS_db_sslmode}" \
+  -D_db_max_conns="${BRICKS_db_max_conns}" \
+  -D_db_stmt_timeout="${BRICKS_db_stmt_timeout}" \
   > bricks.cnf << EOF
 dns_name=_dns_name
 port=_port
@@ -73,6 +102,14 @@ copybook_dir=_copybook_dir
 data_dir=_data_dir
 users_file=_users_file
 transactions_file=_transactions_file
+db_host=_db_host
+db_port=_db_port
+db_user=_db_user
+db_password=_db_password
+db_sslmode=_db_sslmode
+db_max_conns=_db_max_conns
+db_stmt_timeout=_db_stmt_timeout
+databases_file=runtime/databases.conf
 EOF
 
 chmod 400 bricks.cnf
