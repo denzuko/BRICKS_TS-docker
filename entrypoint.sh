@@ -3,7 +3,6 @@ set -e
 
 readcfg() {
         key=$1; shift
-
         test -f $1 && grep "^${key} =" $1 | cut -d'=' -f2 | tr -d '[:space:]'
 }
 
@@ -28,7 +27,6 @@ find bin -maxdepth 1 -type f -name "*${OS}-${ARCH}" -print0 | \
             test ! -e bin/\$(basename "{}"| cut -d- -f1) && \
             ln -s \$(basename "{}") bin/\$(basename "{}"| cut -d- -f1)"
 
-
 umask 0077
 
 # ── PostgreSQL environment variable mapping ──────────────────────────
@@ -45,14 +43,6 @@ umask 0077
 #   POSTGRES_PORT     optional; defaults to 5432
 #
 # BRICKS-specific overrides take precedence over POSTGRES_* vars.
-BRICKS_db_host="${BRICKS_db_host:-${POSTGRES_HOST:-localhost}}"
-BRICKS_db_port="${BRICKS_db_port:-${POSTGRES_PORT:-5432}}"
-BRICKS_db_user="${BRICKS_db_user:-${POSTGRES_USER:-bricks}}"
-BRICKS_db_password="${BRICKS_db_password:-${POSTGRES_PASSWORD:-}}"
-BRICKS_db_sslmode="${BRICKS_db_sslmode:-disable}"
-BRICKS_db_max_conns="${BRICKS_db_max_conns:-8}"
-BRICKS_db_stmt_timeout="${BRICKS_db_stmt_timeout:-30s}"
-BRICKS_db_file="${BRICKS_db_file:-runtime/databases.conf}"
 
 # Configuration generator - Maintainer Note: m4(1) is crufty but functional.
 #                           A cleaner path: spf13/viper + spf13/pflag directly.
@@ -76,14 +66,14 @@ m4 \
   -D_data_dir="${BRICKS_data_dir:-data}" \
   -D_users_file="${BRICKS_users_file:-runtime/users.conf}" \
   -D_transactions_file="${BRICKS_transactions_file:-runtime/transactions.conf}" \
-  -D_databases_file="${BRICKS_db_file}" \
-  -D_db_host="${BRICKS_db_host}" \
-  -D_db_port="${BRICKS_db_port}" \
-  -D_db_user="${BRICKS_db_user}" \
-  -D_db_password="${BRICKS_db_password}" \
-  -D_db_sslmode="${BRICKS_db_sslmode}" \
-  -D_db_max_conns="${BRICKS_db_max_conns}" \
-  -D_db_stmt_timeout="${BRICKS_db_stmt_timeout}" \
+  -D_databases_file="${BRICKS_db_file:-runtime/databases.conf}" \
+  -D_db_host="${BRICKS_db_host:-${POSTGRES_HOST:-localhost}}" \
+  -D_db_port="${BRICKS_db_port:-${POSTGRES_PORT:-5432}}" \
+  -D_db_user="${BRICKS_db_user:-${POSTGRES_USER:-bricks}}" \
+  -D_db_password="${BRICKS_db_password:-${POSTGRES_PASSWORD:-}}" \
+  -D_db_sslmode="${BRICKS_db_sslmode:-disable}" \
+  -D_db_max_conns="${BRICKS_db_max_conns:-8}" \
+  -D_db_stmt_timeout="${BRICKS_db_stmt_timeout:-30s}" \
   > bricks.cnf << EOF
 dns_name=_dns_name
 port=_port
@@ -115,10 +105,6 @@ db_stmt_timeout=_db_stmt_timeout
 EOF
 
 chmod 400 bricks.cnf
-
-RUN_TLS=$(readcfg start_tls bricks.cnf)
-CERT_PATH=$(readcfg tlscert bricks.cnf)
-KEY_PATH=$(readcfg tlskey bricks.cnf)
 
 case  "$(readcfg start_tls bricks.cnf)" in
         [yY][eE][sS])  test -f "$(readcfg tlscert bricks.cnf)" || \
